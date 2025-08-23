@@ -1,41 +1,73 @@
 
 import os
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import pandas as pd
 from Bio import SeqIO
 from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 from Bio.SeqUtils import MeltingTemp
 from io import StringIO
+from tqdm import tqdm
 
-def parse_fasta(input_data):
+def parse_fasta(*input_data):
     """
-    Parse FASTA input, which can be a file path or a FASTA-formatted string.
-    Handles multi-FASTA inputs.
-    """
-    if os.path.isfile(input_data):
-        with open(input_data, 'r') as handle:
-            return list(SeqIO.parse(handle, 'fasta'))
-    else:
-        return list(SeqIO.parse(StringIO(input_data), 'fasta'))
+    Parse one or more inputs into a flat list of SeqRecord objects.
 
-def design_primer_pairs(input_data, 
-                        primer_length=20, 
-                        tm_min=55, 
-                        tm_max=65, 
-                        min_amplicon=100, 
-                        max_amplicon=1000, 
-                        top_n=10, 
-                        max_candidates=50
-                        ):
+    Accepts:
+    - file paths (str)
+    - FASTA-formatted strings
+    - raw sequence strings (no header)
+    - SeqRecord objects
+    - lists/tuples of the above
     """
-    Design primer pairs for a given DNA sequence.
-    Scans for candidate forward and reverse primers within Tm range,
-    forms pairs within amplicon length range, and reports top N based on Tm similarity and average Tm.
-    """
-    records = parse_fasta(input_data)
-    if not records:
-        raise ValueError("No sequences found in input.")
-    record = records[0]  # Take the first sequence
-    seq = str(record.seq.upper())
+    records = []
+
+    # Normalize and flatten a single level of lists/tuples
+    sources = []
+    for item in input_data:
+        if isinstance(item, (list, tuple)):
+            sources.extend(item)
+        else:
+            sources.append(item)
+
+    for src in sources:
+        if isinstance(src, SeqRecord):
+            records.append(src)
+            continue
+
+        if isinstance(src, str) and os.path.isfile(src):
+            with open(src, 'r') as handle:
+                records.extend(list(SeqIO.parse(handle, 'fasta')))
+            continue
+
+        if isinstance(src, str):
+            stripped = src.strip()
+            if not stripped:
+                continue
+            if stripped.startswith('>'):
+                records.extend(list(SeqIO.parse(StringIO(src), 'fasta')))
+            else:
+                # Treat as raw sequence string without FASTA header
+                seq_id = f"seq_{len(records) + 1}"
+                records.append(SeqRecord(Seq(stripped.upper()), id=seq_id, description=""))
+            continue
+
+        raise TypeError(f"Unsupported input type: {type(src)}")
+
+    return records
+
+def _design_primer_pairs_for_single_sequence(seq, seq_id,
+                                            primer_length, 
+                                            tm_min, 
+                                            tm_max,
+                                            min_amplicon, 
+                                            max_amplicon,
+                                            top_n, 
+                                            max_candidates):
+    """Worker: design primer pairs for a single sequence string."""
+    seq = str(seq).upper()
     len_seq = len(seq)
 
     # Collect forward candidates
@@ -84,6 +116,7 @@ def design_primer_pairs(input_data,
                     tm_diff = abs(f['tm'] - r['tm'])
                     avg_tm = (f['tm'] + r['tm']) / 2
                     pairs.append({
+                        'Sequence_ID': seq_id,
                         'forward_start': f['start'],
                         'forward_seq': f['seq'],
                         'forward_tm': f['tm'],
@@ -99,6 +132,60 @@ def design_primer_pairs(input_data,
     pairs.sort(key=lambda p: (p['tm_diff'], -p['avg_tm']))
 
     # Take top N
-    top_pairs = pairs[:top_n]
+    return pairs[:top_n]
 
-    return pd.DataFrame(top_pairs)
+
+def design_primer_pairs(*input_data,
+                        primer_length=20,
+                        tm_min=55,
+                        tm_max=65,
+                        min_amplicon=100,
+                        max_amplicon=1000,
+                        top_n=10,
+                        max_candidates=50
+                        ):
+    """
+    Design primer pairs for one or more DNA sequences.
+    Scans for candidate forward and reverse primers within Tm range,
+    forms pairs within amplicon length range, and reports top N per sequence.
+    When multiple sequences are provided, processing is parallelized across sequences.
+    """
+    records = parse_fasta(*input_data)
+    if not records:
+        raise ValueError("No sequences found in input.")
+
+    # Single sequence: run inline
+    if len(records) == 1:
+        record = records[0]
+        rows = _design_primer_pairs_for_single_sequence(
+            str(record.seq), record.id,
+            primer_length, tm_min, tm_max,
+            min_amplicon, max_amplicon,
+            top_n, max_candidates
+        )
+        return pd.DataFrame(rows)
+
+    # Multiple sequences: parallel execution with progress bar
+    start = time.perf_counter()
+    rows_all = []
+    with ProcessPoolExecutor() as executor:
+        futures = [
+            executor.submit(
+                _design_primer_pairs_for_single_sequence,
+                str(rec.seq), rec.id,
+                primer_length, tm_min, tm_max,
+                min_amplicon, max_amplicon,
+                top_n, max_candidates
+            )
+            for rec in records
+        ]
+
+        with tqdm(total=len(futures), desc="Designing primers", unit="seq") as pbar:
+            for fut in as_completed(futures):
+                rows_all.extend(fut.result())
+                pbar.update(1)
+
+    elapsed = time.perf_counter() - start
+    print(f"Primer design completed for {len(records)} sequences in {elapsed:.2f}s")
+
+    return pd.DataFrame(rows_all)
