@@ -7,9 +7,36 @@ import pandas as pd
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
-from Bio.SeqUtils import MeltingTemp
+import primer3
 from io import StringIO
 from tqdm import tqdm
+
+def _calc_tm_with_primer3(primer_sequence):
+    """Return melting temperature (Tm) using primer3-py, with robust API handling."""
+    seq_upper = str(primer_sequence).upper()
+    # Try top-level function (preferred modern API)
+    try:
+        calc_tm_fn = getattr(primer3, 'calc_tm', None) or getattr(primer3, 'calcTm', None)
+        if calc_tm_fn is not None:
+            return float(calc_tm_fn(seq_upper))
+    except Exception:
+        pass
+
+    # Try ThermoAnalysis class API (alternate API across versions)
+    try:
+        ThermoAnalysis = getattr(primer3, 'ThermoAnalysis', None)
+        if ThermoAnalysis is None and hasattr(primer3, 'thermoanalysis'):
+            ThermoAnalysis = getattr(primer3.thermoanalysis, 'ThermoAnalysis', None)
+        if ThermoAnalysis is not None:
+            analyzer = ThermoAnalysis()
+            if hasattr(analyzer, 'calcTm'):
+                return float(analyzer.calcTm(seq_upper))
+            if hasattr(analyzer, 'calc_tm'):
+                return float(analyzer.calc_tm(seq_upper))
+    except Exception:
+        pass
+
+    raise RuntimeError("primer3-py Tm calculation is unavailable. Ensure primer3-py is installed and up to date.")
 
 def parse_fasta(*input_data):
     """
@@ -74,7 +101,7 @@ def _design_primer_pairs_for_single_sequence(seq, seq_id,
     forward_candidates = []
     for i in range(len_seq - primer_length + 1):
         primer_f = seq[i:i + primer_length]
-        tm_f = MeltingTemp.Tm_NN(primer_f)
+        tm_f = _calc_tm_with_primer3(primer_f)
         if tm_min <= tm_f <= tm_max:
             forward_candidates.append({
                 'start': i + 1,
@@ -92,7 +119,7 @@ def _design_primer_pairs_for_single_sequence(seq, seq_id,
     reverse_candidates = []
     for i in range(len_seq - primer_length + 1):
         primer_r = rc[i:i + primer_length]
-        tm_r = MeltingTemp.Tm_NN(primer_r)
+        tm_r = _calc_tm_with_primer3(primer_r)
         if tm_min <= tm_r <= tm_max:
             start = len_seq - i - primer_length + 1
             reverse_candidates.append({
